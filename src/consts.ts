@@ -1,11 +1,11 @@
 import type { IconMap, SocialLink, Site } from '@/types'
 
 export const SITE: Site = {
-  title: 'astro-erudite',
+  title: 'Arthur Vasseur Blog',
   description:
-    'astro-erudite is a opinionated, unstyled blogging template—built with Astro, Tailwind, and shadcn/ui.',
-  href: 'https://astro-erudite.vercel.app',
-  author: 'jktrn',
+    'Personal blog where I share my thoughts and experiences.',
+  href: 'https://arthurvasseur.fr',
+  author: 'Arthur Vasseur',
   locale: 'en-US',
   featuredPostCount: 2,
   postsPerPage: 3,
@@ -28,21 +28,13 @@ export const NAV_LINKS: SocialLink[] = [
 
 export const SOCIAL_LINKS: SocialLink[] = [
   {
-    href: 'https://github.com/jktrn',
+    href: 'https://github.com/ArthurVasseur',
     label: 'GitHub',
   },
   {
-    href: 'https://twitter.com/enscry',
-    label: 'Twitter',
-  },
-  {
-    href: 'mailto:jason@enscribe.dev',
-    label: 'Email',
-  },
-  {
-    href: '/rss.xml',
-    label: 'RSS',
-  },
+    href: 'https://www.linkedin.com/in/arthur-vasseur/',
+    label: 'LinkedIn',
+  }
 ]
 
 export const ICON_MAP: IconMap = {

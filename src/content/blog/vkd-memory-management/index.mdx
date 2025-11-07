@@ -1,0 +1,146 @@
+---
+title: "Building a Vulkan Memory System: From TLSF Allocator to VkImage and VkBuffer"
+description: "In this new chapter of my Vulkan software driver journey, I dive into GPU memory management, implementing a TLSF allocator for O(1) allocations, dynamically sizing the Vulkan heap based on system RAM, and adding support for VkBuffer and VkImage."
+date: 2025-11-06
+tags: ["Vulkan", "GPU memory", "TLSF", "VkBuffer", "VkImage", "C++20"]
+category: "Graphics"
+draft: false
+authors: ["Arthur Vasseur"]
+---
+
+# Memory management and implementation of VkBuffer/VkImage in **Vkd**
+
+> **Preamble:** This article is the **second** in a series about building a Vulkan driver. I'm writing it as I learn the Vulkan driver ecosystem, so it may contain mistakes or omissions. I'll revisit topics and refine the implementation in future articles.
+
+> **This post is a follow‑up to [the previous article](/blog/vulkan-driver/)** where I described the overall architecture of **Vkd**, my CPU‑based Vulkan driver. After putting in place the ICD infrastructure and command management, I focused on memory allocation and support for the fundamental resources: buffers and images.
+
+In a software driver, the so‑called “GPU” memory is actually host RAM. It is therefore necessary to adapt the memory space allocated to the application without starving the system. I also wanted to follow the Vulkan specification as closely as possible so that the API remains faithful to what a user expects on a real GPU.
+
+## 1 RAM detection and heap sizing
+
+The utility class [`System`](https://github.com/ArthurVasseur/Vkd/blob/b0da6ce0f775057041b65ca0dfc9430e6a908bcb/Src/VkdUtils/System/System.cpp#L108-L123) queries the OS to know the total and available memory. It caches these values to avoid repeated system calls. The static method `ComputeDeviceMemoryHeapSize()` then computes the size of the Vulkan heap as **30 % of total RAM** and rounds it down to the next lower power of 2. This logic is visible in `System.cpp`:
+
+```cpp
+UInt64 System::ComputeDeviceMemoryHeapSize(UInt64 totalRam) noexcept
+{
+    const UInt64 targetSize = static_cast<UInt64>(totalRam * 0.3);
+    if (targetSize == 0)
+        return 0;
+    UInt64 temp = targetSize;
+    int msb = 0;
+    while (temp > 1)
+    {
+        temp >>= 1;
+        msb++;
+    }
+    return 1ULL << msb;
+}
+```
+
+On a system with 64 GiB of RAM, 30 % correspond to 19.2 GiB; rounding down gives a 16 GiB heap. This approach preserves enough memory for the OS and other applications while providing a comfortable space for Vulkan allocations. Power‑of‑two rounding respects hardware conventions and simplifies alignments.
+
+I plan to make this ratio configurable (via an environment variable or a `vkd.toml` file).
+
+## 2 TLSF allocator: O(1) allocations
+
+The computed heap is managed by a **TLSF allocator** (Two‑Level Segregate Fit) implemented in [`VkdUtils/Allocator`](https://github.com/ArthurVasseur/Vkd/tree/b0da6ce0f775057041b65ca0dfc9430e6a908bcb/Src/VkdUtils/Allocator). This allocator uses a contiguous pool and two‑level bitmaps to achieve **constant‑time allocations and frees** with minimal fragmentation. The main characteristics:
+
+- **No dynamic allocation after `Init()`**: the allocator reserves the pool in one block, initializes its free lists and does not perform any further `new` or `malloc`.
+- **Support for alignments up to 4096 bytes**: necessary to respect Vulkan API constraints (for example 256 bytes for UBOs or 4096 bytes for certain images).
+- **Immediate coalescing**: when a block is freed, it is merged with its free neighbours in O(1).
+- **Statistics**: you can query the total size, used space, largest free block and fragmentation rate to diagnose the state of the heap.
+
+The principle of the TLSF is to **segment the range of possible sizes into hierarchical classes**. A first table (First Level) groups blocks according to the power of two surrounding their size, and each entry has a second table (Second Level) that subdivides this range into finer segments. The FLI/SLI pointers determine linked lists of free blocks. When allocating, the algorithm computes these indices from the requested size and then consults the bitmaps to find the next non‑empty list. If there is no block exactly of the correct size, a larger block is split and the remainder is returned to the appropriate free list. When freeing, the block is reinserted and immediately **merged** with its free neighbours. As these operations rely on index calculations and list manipulations, they are performed in constant time (O(1)) and greatly reduce fragmentation.
+
+### TLSF operation diagram
+
+```mermaid
++-----------------------------+
+|  Allocation request (size S)|
++-------------+---------------+
+              |
+              v
++-----------------------------+
+| Compute FLI/SLI indices     |
++-------------+---------------+
+              |
+              v
++-----------------------------+
+| Search next non-empty list  |
+| via bitmaps                 |
++-------------+---------------+
+              |
+              v
+       +------+------+
+       | Free block  |
+       |   found ?   |
+       +------+------+ 
+          |        |
+       Yes|        |No
+          v        v
++----------------+  +-----------------------------+
+| Take block     |  | Find larger block and split |
+| from free list |  +-------------+---------------+
++----------------+                |
+              |                   |
+              +---------+---------+
+                        |
+                        v
+              +----------------------+
+              | Return offset in pool|
+              +----------------------+
+
+```
+
+The TLSF acts as a basic building block: it simply provides offsets within the pool. Vulkan objects (buffers, images…) use these offsets via `DeviceMemory`, which bridges the memory manager and the API.
+
+## 3 DeviceMemory: link between heap and resources
+
+The `DeviceMemory` class represents a Vulkan allocation (`VkDeviceMemory`). In the software implementation:
+
+- When `vkAllocateMemory` is called, it requests a block from the TLSF allocator with the appropriate size and alignment. If the heap is saturated, the function returns `VK_ERROR_OUT_OF_DEVICE_MEMORY`.
+- `vkMapMemory` returns a **direct CPU pointer** into the pool, computed from the TLSF offset. As the heap is contiguous and always resident in RAM, mapping is instantaneous: no extra copies are performed.
+- `vkBindBufferMemory` or `vkBindImageMemory` simply associate a `DeviceMemory` object and an offset with a buffer or an image.
+- `vkFreeMemory` releases the allocation in the TLSF and destroys the `DeviceMemory` object.
+
+## 4 Implementation of VkBuffer
+
+A Vulkan buffer is a linear memory region used to store vertices, indices, uniform data, etc. In **Vkd**, the `Buffer` class merely stores:
+
+- the `size` of the buffer;
+- the usage flags (`usage`);
+- a pointer to the `DeviceMemory` it is bound to and an offset.
+
+## 5 Implementation of VkImage
+
+Images (textures, render targets) require more information: format, dimensions, number of mipmaps, etc. The `Image` class stores these parameters and provides transfer operations. The method [`GetMemoryRequirements()`](https://github.com/ArthurVasseur/Vkd/blob/b0da6ce0f775057041b65ca0dfc9430e6a908bcb/Src/Vkd/Image/Image.inl#L53-L61) computes the required memory size based on the format (number of bytes per pixel) and the dimensions of the image:
+
+```cpp
+inline void Image::GetMemoryRequirements(VkMemoryRequirements& memoryRequirements) const
+{
+    VkDeviceSize pixelSize = vkuFormatElementSize(m_format);
+    VkDeviceSize imageSize = static_cast<VkDeviceSize>(m_extent.width) * m_extent.height * m_extent.depth * pixelSize;
+    memoryRequirements.size = imageSize;
+    memoryRequirements.alignment = 256;
+    memoryRequirements.memoryTypeBits = 0xFFFFFFFF;
+}
+```
+The `alignment` field is set to **256 bytes** to align with most `VK_IMAGE_TILING_LINEAR` tiling constraints and compressed formats. The `BindImageMemory()` method simply stores a pointer to the `DeviceMemory` and the offset; the image becomes usable only after this operation.
+
+## 6 Transfer operations on buffers and images
+
+To test copying and filling data, I implemented several transfer commands executed on the CPU:
+
+1. **[vkCmdFillBuffer](https://github.com/ArthurVasseur/Vkd/blob/b0da6ce0f775057041b65ca0dfc9430e6a908bcb/Src/VkdSoftware/CpuContext/CpuContext.cpp#L126-L141)**: records an operation that fills a buffer region with a 32‑bit value. Execution in `CpuContext::FillBuffer()` maps the memory and writes this value in a loop.
+2. **[vkCmdCopyBuffer](https://github.com/ArthurVasseur/Vkd/blob/b0da6ce0f775057041b65ca0dfc9430e6a908bcb/Src/VkdSoftware/CpuContext/CpuContext.cpp#L62-L84)** / **[vkCmdCopyBuffer2](https://github.com/ArthurVasseur/Vkd/blob/b0da6ce0f775057041b65ca0dfc9430e6a908bcb/Src/VkdSoftware/CpuContext/CpuContext.cpp#L86-L108)**: copies regions between two buffers via `std::memcpy`. Operations are recorded in `Buffer::OpCopy` and executed in `CpuContext::CopyBuffer()`.
+3. **[vkCmdCopyBufferToImage](https://github.com/ArthurVasseur/Vkd/blob/b0da6ce0f775057041b65ca0dfc9430e6a908bcb/Src/VkdSoftware/CpuContext/CpuContext.cpp#L189-L234)** and **[vkCmdCopyImageToBuffer](https://github.com/ArthurVasseur/Vkd/blob/b0da6ce0f775057041b65ca0dfc9430e6a908bcb/Src/VkdSoftware/CpuContext/CpuContext.cpp#L236-L281)**: transfer data between a linear buffer and an image. The CPU implementation iterates over each line and each slice (`depth`) to correctly handle the image’s **row pitch**. The `bufferRowLength` parameter is respected to allow a different pitch in the buffer.
+4. **[vkCmdCopyImage](https://github.com/ArthurVasseur/Vkd/blob/b0da6ce0f775057041b65ca0dfc9430e6a908bcb/Src/VkdSoftware/CpuContext/CpuContext.cpp#L143-L187)**: copies regions from one image to another, taking offsets and pixel size into account.
+5. **[vkCmdClearColorImage](https://github.com/ArthurVasseur/Vkd/blob/b0da6ce0f775057041b65ca0dfc9430e6a908bcb/Src/VkdSoftware/CpuContext/CpuContext.cpp#L283-L312)**: fills an image with a solid colour by writing the packed (R–G–B–A) value directly into image memory.
+
+All these operations are **recordings** in the command buffer. They are executed only when `vkQueueSubmit` is called, which submits commands to a `ThreadPool` thread. This design decouples recording (multithreaded if desired) from execution (ordered by queues), as explained in the previous post.
+
+## 7 Conclusion
+
+This stage added support for buffers and images in **Vkd** while setting up a realistic memory allocation system. Automatic heap sizing at 30 % of RAM, the TLSF allocator and `DeviceMemory` management provide a solid foundation for upcoming features.
+
+I now plan to implement rendering pipelines, shader and GPU image management, and more advanced synchronization primitives (semaphores, events). In the meantime, feel free to check out the [Vkd repository on GitHub](https://github.com/ArthurVasseur/Vkd) to follow the project’s progress.

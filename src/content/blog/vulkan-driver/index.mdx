@@ -1,0 +1,793 @@
+---
+title: " Building a CPU-Based Vulkan driver from Scratch"
+description: "A practical guide to building your first Vulkan ICD driver. Learn how to implement loader negotiation, handle conversions, ThreadPool architecture, and command dispatching with Vkd, a modern C++20 software driver."
+date: 2025-10-29
+tags: ["Vulkan", "ICD", "Driver Development", "Graphics", "C++20", "ThreadPool", "Software Rendering"]
+category: "Graphics"
+draft: false
+authors: ['Arthur Vasseur']
+---
+
+# Getting Started with Vulkan Driver Development: a Practical Guide Using the **Vkd** Software Driver
+
+> **Preamble:** This article is the **first** in a series about building a Vulkan driver. I'm writing it as I learn the Vulkan driver ecosystem, so it may contain mistakes or omissions. I'll revisit topics and refine the implementation in future articles.
+
+I built Vkd (short for *Vulkan Driver*) as an experimental CPU‑based ICD using modern C++20. It's cross‑platform and designed as a learning project. Throughout this article, I use Vkd as a concrete example of how I have structured a driver. I reference the [official Vulkan 1.3 specification](https://registry.khronos.org/vulkan/specs/1.3-extensions/html/vkspec.html) and the [Vulkan Loader and ICD Interface](https://github.com/KhronosGroup/Vulkan-Loader/blob/main/docs/LoaderDriverInterface.md) for correctness.
+
+**Current Status:** I've successfully implemented the core ICD infrastructure with working transfer operations (buffer fill/copy), fence synchronization, and a ThreadPool-based command execution system. A test program validates the end-to-end pipeline. Rendering features (shaders, pipelines, images) are not yet implemented.
+
+---
+
+## 1 Project architecture: abstraction and implementation
+
+**Vkd** is structured as a layered system separating the **agnostic driver interface** from **hardware-specific implementations**. This design allows multiple backend implementations to coexist while sharing common infrastructure.
+
+### The two-layer architecture
+
+
+1. **`vkd` (static library)** – The platform-agnostic core where I define abstract classes for all Vulkan objects (`Instance`, `PhysicalDevice`, `Device`, `CommandBuffer`, etc.). This layer implements:
+   - ICD interface negotiation ([Icd.cpp](https://github.com/ArthurVasseur/Vkd/tree/711c288ad8596880a08ef961480cffb59cfa78a0/Src/Vkd/Icd/Icd.cpp))
+   - Entry-point dispatch tables
+   - Handle conversions and type-safety macros
+   - Vulkan object lifecycle management
+   - Command recording abstractions
+
+2. **`vkd-Software` (shared library)** – My concrete CPU-based implementation that inherits from `vkd` base classes. This layer provides:
+   - `software::PhysicalDevice` – Emulates a CPU-based GPU
+   - `software::Device` & `software::Queue` – CPU execution contexts
+   - `CommandDispatcher` – Executes recorded commands through `CpuContext`
+   - Memory management using host RAM
+
+### Extensibility for real hardware
+
+I designed this architecture to support future hardware implementations like:
+- **`vkd-AMD`** – AMD GPU backend (interfacing with amdgpu kernel driver)
+- **`vkd-Nvidia`** – Nvidia GPU backend (using nvidia-drm)
+- **`vkd-Intel`** – Intel integrated graphics backend
+
+Each implementation would compile as a separate DLL with its own ICD manifest, registered independently with the Vulkan loader. For example, `vkd-Software.json` currently points to `vkd-Software.dll`:
+
+```json
+{
+    "file_format_version": "1.0.1",
+    "ICD": {
+        "library_path": "C:\\path\\to\\vkd-Software.dll",
+        "api_version": "1.4.304",
+        "library_arch": "64",
+        "is_portability_driver": false
+    }
+}
+```
+
+### Build system (xmake)
+
+The [xmake.lua](xmake.lua#L58-L98) defines the `vkd` target with common infrastructure, then iterates over a `drivers` table to generate `vkd-{DriverName}` targets. Each driver target:
+- Links against the `vkd` static library
+- Includes its own source tree (`Src/Vkd{DriverName}/`)
+- Generates an ICD manifest after build
+
+This approach ensures that adding a new hardware backend requires minimal build system changes-just add an entry to the `drivers` table.
+
+---
+
+## 2 Understanding the loader and dispatch chains
+
+Before writing a driver, you need to understand how the Vulkan loader works. The loader sits between applications and drivers. At startup, it enumerates layer and driver manifest files and builds a **dispatch chain**. Each exported Vulkan function, such as [`vkCreateInstance`](https://registry.khronos.org/vulkan/specs/1.3-extensions/html/vkspec.html#vkCreateInstance), is a *trampoline* that calls into the loader. The loader consults the list of layers and ICDs and routes the call down the chain so that each layer sees it before the ICD.
+
+A Vulkan driver does not export the official function names directly; instead, it implements **ICD interface functions** such as [`vk_icdGetInstanceProcAddr`](https://github.com/KhronosGroup/Vulkan-Loader/blob/main/docs/LoaderDriverInterface.md#driver-vulkan-entry-points) so that the loader can query it for entry points. The [Loader specification](https://github.com/KhronosGroup/Vulkan-Loader/blob/main/docs/LoaderDriverInterface.md#icd-interface-version-negotiation) explains that this function must return valid pointers for all global‑level and instance‑level commands, including `vkGetDeviceProcAddr`, and that global entry points must also be queryable with a `NULL` instance.
+
+The loader also needs to know which version of the ICD interface the driver supports. During initialisation it calls [`vk_icdNegotiateLoaderICDInterfaceVersion`](https://github.com/KhronosGroup/Vulkan-Loader/blob/main/docs/LoaderDriverInterface.md#icd-interface-version-negotiation), which allows the driver to tell the loader its supported version. For example, if your ICD supports interface version 7, the loader will call [`vk_icdGetPhysicalDeviceProcAddr`](https://github.com/KhronosGroup/Vulkan-Loader/blob/main/docs/LoaderDriverInterface.md#getphysicaldeviceprocaddr) for physical-device‑level commands. The spec also notes that for drivers supporting only Vulkan 1.0, the loader will pass a clamped [`VkApplicationInfo`](https://registry.khronos.org/vulkan/specs/1.3-extensions/html/vkspec.html#VkApplicationInfo) with `apiVersion = VK_API_VERSION_1_0` to prevent `VK_ERROR_INCOMPATIBLE_DRIVER`.
+
+---
+
+## 3 Implementing `vk_icdGetInstanceProcAddr` and entry‑point dispatch
+
+Because the driver does not export symbols such as [`vkCreateInstance`](https://registry.khronos.org/vulkan/specs/1.3-extensions/html/vkspec.html#vkCreateInstance) or [`vkEnumeratePhysicalDevices`](https://registry.khronos.org/vulkan/specs/1.3-extensions/html/vkspec.html#vkEnumeratePhysicalDevices), the loader uses [`vk_icdGetInstanceProcAddr`](https://github.com/KhronosGroup/Vulkan-Loader/blob/main/docs/LoaderDriverInterface.md#driver-vulkan-entry-points) to query pointers to *global* and *instance‑level* functions.
+
+A typical implementation does the following:
+
+1. **Match function names.** The ICD compares the requested name against a static map of supported commands and returns the corresponding pointer. Vkd's `Icd` class implements this with C++ macros to reduce boilerplate.
+2. **Return `NULL` for unsupported functions.** Returning `NULL` tells the loader to skip or emulate the function. For instance, since Vkd doesn't implement swapchains yet, the loader won't advertise `VK_KHR_swapchain`.
+3. **Provide pointers for ICD interface functions.** The ICD must return function pointers to [`vk_icdGetInstanceProcAddr`](https://github.com/KhronosGroup/Vulkan-Loader/blob/main/docs/LoaderDriverInterface.md#driver-vulkan-entry-points), [`vk_icdNegotiateLoaderICDInterfaceVersion`](https://github.com/KhronosGroup/Vulkan-Loader/blob/main/docs/LoaderDriverInterface.md#icd-interface-version-negotiation), and optionally [`vk_icdGetPhysicalDeviceProcAddr`](https://github.com/KhronosGroup/Vulkan-Loader/blob/main/docs/LoaderDriverInterface.md#getphysicaldeviceprocaddr) when queried.
+
+### Example: Vkd's entry-point lookup
+
+Here is how [Icd.cpp](https://github.com/ArthurVasseur/Vkd/tree/711c288ad8596880a08ef961480cffb59cfa78a0/Src/Vkd/Icd/Icd.cpp#L18-L62) implements `vk_icdGetInstanceProcAddr`:
+
+```cpp
+PFN_vkVoidFunction Icd::GetInstanceProcAddr(VkInstance pInstance, const char* pName)
+{
+    if (pName == nullptr)
+        return nullptr;
+
+    #define VKD_ENTRYPOINT_LOOKUP(klass, name) \
+        if (strcmp(pName, "vk" #name) == 0) \
+            return (PFN_vkVoidFunction)static_cast<PFN_vk##name>(klass::name)
+
+    // Standard Vulkan API functions
+    VKD_ENTRYPOINT_LOOKUP(vkd::Instance, CreateInstance);
+    VKD_ENTRYPOINT_LOOKUP(vkd::Instance, DestroyInstance);
+    VKD_ENTRYPOINT_LOOKUP(vkd::Instance, EnumeratePhysicalDevices);
+    VKD_ENTRYPOINT_LOOKUP(vkd::PhysicalDevice, GetPhysicalDeviceProperties);
+    VKD_ENTRYPOINT_LOOKUP(vkd::Device, CreateDevice);
+    // ... more entries
+
+    #undef VKD_ENTRYPOINT_LOOKUP
+
+    #define VKD_ICD_ENTRYPOINT_LOOKUP(klass, name) \
+        if (strcmp(pName, "vk_icd" #name) == 0) \
+            return (PFN_vkVoidFunction) klass::name
+
+    // ICD interface functions
+    VKD_ICD_ENTRYPOINT_LOOKUP(vkd::Icd, NegotiateLoaderICDInterfaceVersion);
+    VKD_ICD_ENTRYPOINT_LOOKUP(vkd::Icd, GetInstanceProcAddr);
+    VKD_ICD_ENTRYPOINT_LOOKUP(vkd::Icd, GetPhysicalDeviceProcAddr);
+
+    #undef VKD_ICD_ENTRYPOINT_LOOKUP
+
+    return nullptr; // Function not supported
+}
+```
+
+---
+
+## 4 Type conversions and handle wrappers
+
+An essential part of writing a C++ Vulkan driver is converting between opaque Vulkan handles and internal C++ objects. Handles such as `VkInstance` or `VkBuffer` are just pointers to opaque data, while the driver manipulates strongly typed C++ objects (`Instance`, `Device`, `Buffer`, etc.).
+
+### Dispatchable vs Non-Dispatchable Handles
+
+The Vulkan specification distinguishes between two types of handles, which require different internal representations:
+
+**Dispatchable handles** (`VkInstance`, `VkPhysicalDevice`, `VkDevice`, `VkQueue`, `VkCommandBuffer`):
+- **Must** have a loader dispatch table pointer as their first member (required by the Vulkan loader spec)
+- Wrapped in a `DispatchableObject<T>` structure defined in [ObjectBase.hpp](https://github.com/ArthurVasseur/Vkd/tree/711c288ad8596880a08ef961480cffb59cfa78a0/Src/Vkd/ObjectBase/ObjectBase.hpp#L30-L35):
+
+```cpp
+template<typename T>
+struct DispatchableObject
+{
+    VK_LOADER_DATA LoaderData;  // Dispatch table pointer (first member!)
+    T* Object;                  // Actual object pointer
+};
+```
+
+The loader intercepts function calls by reading the dispatch table from the first member, which is why this layout is mandatory for dispatchable handles.
+
+**Non-dispatchable handles** (`VkBuffer`, `VkDeviceMemory`, `VkFence`, `VkPipeline`, `VkCommandPool`, etc.):
+- Don't need dispatch tables (they're implicitly associated with a device that already has one)
+- Stored as **direct pointers** to objects, no wrapper structure needed
+- More efficient: one less indirection compared to dispatchable handles
+
+### Conversion macros
+
+Vkd provides conversion macros in [Defines.hpp](https://github.com/ArthurVasseur/Vkd/tree/711c288ad8596880a08ef961480cffb59cfa78a0/Src/Vkd/Defines.hpp#L47-L74) that handle both types transparently:
+
+```cpp
+// Generic conversion macros (work for both types via FromHandle)
+#define VKD_FROM_HANDLE(type, name, handle)    \
+    VKD_CHECK(handle != nullptr);              \
+    type* name = type::FromHandle(handle);     \
+    VKD_CHECK((name) != nullptr);              \
+    VKD_CHECK(dynamic_cast<type*>(name) != nullptr)
+
+#define VKD_TO_HANDLE(type, handle) (type)(handle)
+
+// For dispatchable handles: unwrap DispatchableObject
+#define VKD_DISPATCHABLE_HANDLE(type)                                       \
+    static inline type* FromHandle(Vk##type instance)                       \
+    {                                                                       \
+        auto* dispatchable = reinterpret_cast<DispatchableObject<type>*>(instance); \
+        if (!dispatchable) return nullptr;                                  \
+        if (dispatchable->Object->GetObjectType() != type::ObjectType)      \
+        {                                                                   \
+            CCT_ASSERT_FALSE("Invalid Object Type");                        \
+            return nullptr;                                                 \
+        }                                                                   \
+        return dispatchable->Object;  // Extract actual object              \
+    }
+
+// For non-dispatchable handles: direct pointer cast
+#define VKD_NON_DISPATCHABLE_HANDLE(type)                                   \
+    static inline type* FromHandle(Vk##type instance)                       \
+    {                                                                       \
+        return reinterpret_cast<type*>(instance);  // Simple cast           \
+    }
+```
+
+Each Vulkan object class declares which type it is. For example, [Buffer.hpp](https://github.com/ArthurVasseur/Vkd/tree/711c288ad8596880a08ef961480cffb59cfa78a0/Src/Vkd/Buffer/Buffer.hpp#L37):
+
+```cpp
+class Buffer : public ObjectBase
+{
+public:
+    static constexpr VkObjectType ObjectType = VK_OBJECT_TYPE_BUFFER;
+    VKD_NON_DISPATCHABLE_HANDLE(Buffer);  // Buffer is non-dispatchable
+    // ...
+};
+```
+
+Whereas [Device.hpp](https://github.com/ArthurVasseur/Vkd/tree/711c288ad8596880a08ef961480cffb59cfa78a0/Src/Vkd/Device/Device.hpp) declares:
+
+```cpp
+class Device : public ObjectBase
+{
+public:
+    static constexpr VkObjectType ObjectType = VK_OBJECT_TYPE_DEVICE;
+    VKD_DISPATCHABLE_HANDLE(Device);  // Device is dispatchable
+    // ...
+};
+```
+
+### Example: Bidirectional conversion in vkGetDeviceQueue
+
+Here's a simple example from [Device.cpp](https://github.com/ArthurVasseur/Vkd/tree/711c288ad8596880a08ef961480cffb59cfa78a0/Src/Vkd/Device/Device.cpp#L247-L263) showing both conversions:
+
+```cpp
+void Device::GetDeviceQueue(VkDevice pDevice, uint32_t queueFamilyIndex,
+                            uint32_t queueIndex, VkQueue* pQueue)
+{
+    // Convert VkDevice (dispatchable) -> Device*
+    VKD_FROM_HANDLE(Device, device, pDevice);
+    VKD_CHECK(pQueue);
+
+    // Retrieve the queue object from the device's internal map
+    auto* queue = device->GetQueue(queueFamilyIndex, queueIndex);
+    if (!queue)
+    {
+        *pQueue = VK_NULL_HANDLE;
+        return;
+    }
+
+    // Convert Queue* -> VkQueue (dispatchable)
+    *pQueue = VKD_TO_HANDLE(VkQueue, queue);
+}
+```
+
+The same pattern works for non-dispatchable handles (like `VkBuffer` or `VkFence`), but without the `DispatchableObject` wrapper overhead-they're just direct pointer casts.
+
+---
+
+## 5 Creating an instance
+
+After negotiation, the driver must implement [`vkCreateInstance`](https://registry.khronos.org/vulkan/specs/1.3-extensions/html/vkspec.html#vkCreateInstance). Vkd's `Instance` class performs the following steps:
+
+1. Validate `VkInstanceCreateInfo`, checking requested extensions and API version.
+2. Enumerate physical devices by calling `EnumeratePlatformPhysicalDevices`.
+3. Build an instance dispatch table mapping function names to pointers.
+4. Return the handle to the loader.
+
+The [Vulkan spec on instance creation](https://registry.khronos.org/vulkan/specs/1.3-extensions/html/vkspec.html#initialization-instances) details this process.
+
+---
+
+## 6 Enumerating physical devices
+
+When [`vkEnumeratePhysicalDevices`](https://registry.khronos.org/vulkan/specs/1.3-extensions/html/vkspec.html#vkEnumeratePhysicalDevices) is called, the driver must provide an array of physical device handles. Each represents a hardware or software device. In Vkd, this is implemented as a single `software::PhysicalDevice`.
+
+It fills `VkPhysicalDeviceProperties`, queue family data, and feature structures.
+
+---
+
+## 7 Creating a device and queues
+
+According to the Vulkan specification, **all device queues are created at the same time as the device** and are specified via the array of [`VkDeviceQueueCreateInfo`](https://registry.khronos.org/vulkan/specs/1.3-extensions/html/vkspec.html#VkDeviceQueueCreateInfo) structures passed to [`vkCreateDevice`](https://registry.khronos.org/vulkan/specs/1.3-extensions/html/vkspec.html#vkCreateDevice). The spec further clarifies that *the number of queues created for each queue family is defined at device creation* (see [Device and Queue Creation](https://registry.khronos.org/vulkan/specs/1.3-extensions/html/vkspec.html#devsandqueues)).
+
+### What this implies
+- You **cannot** create or destroy queues after the device is created.
+- The driver must validate requested families/counts against `vkGetPhysicalDeviceQueueFamilyProperties` and **instantiate the queues** as part of `vkCreateDevice`.
+- Applications retrieve the already-created handles with [`vkGetDeviceQueue`](https://registry.khronos.org/vulkan/specs/1.3-extensions/html/vkspec.html#vkGetDeviceQueue) / [`vkGetDeviceQueue2`](https://registry.khronos.org/vulkan/specs/1.3-extensions/html/vkspec.html#vkGetDeviceQueue2); these do **not** create queues.
+
+### Minimal driver-side flow (Vkd-style pseudocode)
+```cpp
+VkResult Device::Create(PhysicalDevice& phys, const VkDeviceCreateInfo* ci) {
+    //[...]
+
+    // Create queues now (spec requirement)
+    for (uint32_t i = 0; i < ci->queueCreateInfoCount; ++i) {
+        const VkDeviceQueueCreateInfo& qci = ci->pQueueCreateInfos[i];
+        for (uint32_t q = 0; q < qci.queueCount; ++q) {
+            auto qObj = std::make_unique<software::Queue>();
+            VK_CHECK(qObj->Create(*this, qci.queueFamilyIndex, q, qci.flags));
+            m_queues[{qci.queueFamilyIndex, q}] = std::move(qObj);
+        }
+    }
+
+    return VK_SUCCESS;
+}
+```
+
+### Retrieving queues (does not create)
+```cpp
+void Device::GetDeviceQueue(uint32_t family, uint32_t index, VkQueue* out) const {
+    auto it = m_queues.find({family, index});
+    VKD_CHECK(it != m_queues.end());
+    *out = VKD_TO_HANDLE(VkQueue, it->second.get());
+}
+```
+---
+
+## 8 ThreadPool architecture for asynchronous queue execution
+
+I implemented asynchronous command execution using a custom `ThreadPool` class located in [VkdUtils/ThreadPool](https://github.com/ArthurVasseur/Vkd/tree/711c288ad8596880a08ef961480cffb59cfa78a0/Src/VkdUtils/ThreadPool).
+
+### Why a ThreadPool?
+
+My initial implementation used raw `std::thread` with `detach()` for queue submissions. However, I quickly realized this approach had several drawbacks:
+
+1. **Resource overhead**: Creating and destroying threads for every queue submission is expensive
+2. **Uncontrolled thread count**: Multiple rapid submissions could spawn excessive threads
+3. **Undefined behavior on shutdown**: If the program terminates before detached threads finish execution, resources may be destroyed prematurely, leading to undefined behavior or crashes.
+4. **Difficult wait semantics**: Implementing `vkQueueWaitIdle` required tracking all detached threads
+
+The ThreadPool I built solves these issues by maintaining a fixed pool of worker threads that process tasks from a shared queue.
+
+### ThreadPool API
+
+The [ThreadPool.hpp](https://github.com/ArthurVasseur/Vkd/tree/711c288ad8596880a08ef961480cffb59cfa78a0/Src/VkdUtils/ThreadPool/ThreadPool.hpp) interface provides two submission modes:
+
+```cpp
+// Fire-and-forget for void-returning functions
+template<typename F>
+    requires std::invocable<std::decay_t<F>> && std::is_void_v<std::invoke_result_t<std::decay_t<F>>>
+void AddTask(F&& f);
+
+// Returns std::future<T> for result retrieval and chaining
+template<typename F>
+    requires std::invocable<std::decay_t<F>>
+auto Submit(F&& f) -> std::future<std::invoke_result_t<std::decay_t<F>>>;
+```
+
+Key features:
+- **Modern C++20**: Uses `std::jthread`, `std::stop_token`, and concepts for clean shutdown
+- **Wait operations**: `Wait()` and `WaitFor()` block until all in-flight tasks complete
+- **Graceful shutdown**: `RequestStop()` prevents new submissions while finishing current work
+- **Thread-safe**: All public methods use appropriate synchronization primitives
+
+### How to integrate queue serialization
+
+The Vulkan specification states:
+
+> *Queue submission commands (**vkQueueSubmit**, **vkQueueBindSparse**) have no implicit ordering constraints, but **submission order** within the same queue defines the submission order for batches.*
+
+I implement this requirement using **chained futures**. Each `Queue` maintains:
+
+```cpp
+// From https://github.com/ArthurVasseur/Vkd/tree/711c288ad8596880a08ef961480cffb59cfa78a0/Src/VkdSoftware/Queue/Queue.hpp
+std::future<bool> m_previousSubmit;
+std::mutex m_submitMutex;
+```
+
+When `vkQueueSubmit` is called (see [Queue.cpp:38-59](https://github.com/ArthurVasseur/Vkd/tree/711c288ad8596880a08ef961480cffb59cfa78a0/Src/VkdSoftware/Queue/Queue.cpp#L38-L59)):
+
+1. The previous `std::future` is moved into the new task's lambda capture
+2. The task waits for the previous future before executing
+3. The new future becomes `m_previousSubmit` for the next submission
+
+This creates a **dependency chain** where submission N+1 automatically waits for submission N to complete, ensuring proper ordering while still allowing parallel execution across different queues.
+
+### Example: Queue::WaitIdle implementation
+
+The [WaitIdle](https://github.com/ArthurVasseur/Vkd/tree/711c288ad8596880a08ef961480cffb59cfa78a0/Src/VkdSoftware/Queue/Queue.cpp#L64-L77) implementation simply waits for the last submission:
+
+```cpp
+VkResult Queue::WaitIdle()
+{
+    std::lock_guard<std::mutex> lock(m_submitMutex);
+
+    // Wait for the previous submit to complete
+    if (m_previousSubmit.valid())
+    {
+        m_previousSubmit.wait();
+    }
+
+    return VK_SUCCESS;
+}
+```
+
+This guarantees that all prior submissions have finished executing, as each submission waits for its predecessor in the chain.
+
+---
+
+## 9 Recording and dispatching commands
+
+Command buffers record GPU‑like operations. Functions like [`vkBeginCommandBuffer`](https://registry.khronos.org/vulkan/specs/1.3-extensions/html/vkspec.html#vkBeginCommandBuffer), [`vkCmdCopyBuffer`](https://registry.khronos.org/vulkan/specs/1.3-extensions/html/vkspec.html#vkCmdCopyBuffer), and [`vkEndCommandBuffer`](https://registry.khronos.org/vulkan/specs/1.3-extensions/html/vkspec.html#vkEndCommandBuffer) add entries to the command buffer.
+
+### Command recording architecture
+
+Following the Vulkan specification, I've separated command recording from execution into two distinct phases:
+
+1. **Recording phase** (`vkCmdXXX` functions): When `vkCmdCopyBuffer` or similar functions are called, they **do not execute immediately**. Instead, the command buffer creates an operation structure (e.g., `Buffer::OpCopy`) and stores it in a `std::vector<Op>`. This is purely a recording operation—no actual work happens.
+
+2. **Execution phase** (`vkQueueSubmit`): Only when `vkQueueSubmit` is called does execution begin. The queue submits the recorded command buffer to the ThreadPool, which instantiates a `CpuContext` and `CommandDispatcher`, then iterates through and executes the recorded operations asynchronously.
+
+This separation is fundamental to Vulkan's design: recording can happen on any thread, while execution is controlled by the queue and respects submission order.
+
+### Example: Command buffer operations
+
+[CommandBuffer.hpp](https://github.com/ArthurVasseur/Vkd/tree/711c288ad8596880a08ef961480cffb59cfa78a0/Src/Vkd/CommandBuffer/CommandBuffer.hpp#L29) defines operations as a variant of all possible command types:
+
+```cpp
+using Op = std::variant<Buffer::Op, vkd::Op, /*...*/>;
+```
+
+[Ops.hpp](https://github.com/ArthurVasseur/Vkd/tree/711c288ad8596880a08ef961480cffb59cfa78a0/Src/Vkd/CommandBuffer/Ops.hpp) defines the operation structures:
+
+```cpp
+struct OpBindVertexBuffer
+{
+    std::vector<Buffer*> Buffers;
+    std::vector<VkDeviceSize> Offsets;
+    UInt32 FirstBinding;
+};
+
+struct OpDraw
+{
+    UInt32 VertexCount;
+    UInt32 InstanceCount;
+    UInt32 FirstVertex;
+    UInt32 FirstInstance;
+};
+
+struct OpBindPipeline
+{
+    VkPipelineBindPoint BindPoint;
+    Pipeline* Pipeline;
+};
+```
+
+Each Vulkan command (e.g., `vkCmdDraw`) is recorded as a corresponding operation structure pushed into the command buffer's operation vector.
+
+---
+
+## 10 The software implementation: CommandDispatcher & CpuContext
+
+In the `vkd-Software` driver, I've implemented CPU-based execution of Vulkan commands. In this section, I'll explain how `CommandDispatcher` and `CpuContext` work together to execute recorded commands.
+
+### Architecture overview
+
+```
+Queue::Submit
+    └─> spawns thread
+         └─> CpuContext ctx           (execution state)
+         └─> CommandDispatcher disp   (visitor pattern)
+              └─> disp.Execute(cmdBuf)
+                   └─> for each operation in cmdBuf:
+                        std::visit(operation) → ctx.Draw() / ctx.CopyBuffer() / ...
+```
+
+### CommandDispatcher: The visitor pattern
+
+[CommandDispatcher.hpp](https://github.com/ArthurVasseur/Vkd/tree/711c288ad8596880a08ef961480cffb59cfa78a0/Src/VkdSoftware/CommandDispatcher/CommandDispatcher.hpp) defines a visitor that dispatches operations to the `CpuContext`:
+
+```cpp
+class CommandDispatcher
+{
+public:
+    explicit CommandDispatcher(CpuContext& ctx);
+
+    VkResult Execute(const vkd::CommandBuffer& cb);
+
+private:
+    VkResult operator()(vkd::Buffer::OpFill op);
+    VkResult operator()(vkd::Buffer::OpCopy op);
+    // ... more operation handlers
+
+    CpuContext* m_context;
+};
+```
+
+The `Execute` method in [CommandDispatcher.cpp](https://github.com/ArthurVasseur/Vkd/tree/711c288ad8596880a08ef961480cffb59cfa78a0/Src/VkdSoftware/CommandDispatcher/CommandDispatcher.cpp#L9-L29) uses `std::visit` to dispatch each operation:
+
+```cpp
+VkResult CommandDispatcher::Execute(const vkd::CommandBuffer& cb)
+{
+    if (!cb.IsSealed())
+        return VK_ERROR_VALIDATION_FAILED_EXT;
+
+    const auto& ops = cb.GetOps();
+    for (const auto& op : ops)
+    {
+        VkResult result = std::visit([this]<typename T>(T operation)
+        {
+            return (*this)(std::move(operation));
+        }, op);
+
+        if (result != VK_SUCCESS)
+            return result;
+    }
+
+    return VK_SUCCESS;
+}
+```
+
+Each overloaded `operator()` forwards the operation to the appropriate `CpuContext` method:
+
+```cpp
+VkResult CommandDispatcher::operator()(vkd::Buffer::OpCopy op)
+{
+    return m_context->CopyBuffer(std::move(op));
+}
+
+VkResult CommandDispatcher::operator()(vkd::OpDraw op)
+{
+    return m_context->Draw(std::move(op));
+}
+```
+
+### CpuContext: Execution state and implementation
+
+[CpuContext.hpp](https://github.com/ArthurVasseur/Vkd/tree/711c288ad8596880a08ef961480cffb59cfa78a0/Src/VkdSoftware/CpuContext/CpuContext.hpp) maintains the execution state for the CPU renderer:
+
+```cpp
+class CpuContext
+{
+public:
+    CpuContext();
+
+    VkResult CopyBuffer(vkd::Buffer::OpCopy op);
+    VkResult FillBuffer(vkd::Buffer::OpFill op);
+    // ... more command implementations
+};
+```
+
+#### Example implementations
+
+**CopyBuffer** ([CpuContext.cpp:55-77](https://github.com/ArthurVasseur/Vkd/tree/711c288ad8596880a08ef961480cffb59cfa78a0/Src/VkdSoftware/CpuContext/CpuContext.cpp#L55-L77)) performs CPU-side memory copies:
+
+```cpp
+VkResult CpuContext::CopyBuffer(vkd::Buffer::OpCopy op)
+{
+    for (auto& region : op.regions)
+    {
+        cct::UByte* srcData = nullptr;
+        op.src->GetMemory()->Map(region.srcOffset, region.size, reinterpret_cast<void**>(&srcData));
+
+        cct::UByte* dstData = nullptr;
+        op.dst->GetMemory()->Map(region.dstOffset, region.size, reinterpret_cast<void**>(&dstData));
+
+        std::memcpy(dstData, srcData, region.size);
+
+        op.dst->GetMemory()->Unmap();
+        op.src->GetMemory()->Unmap();
+    }
+
+    return VK_SUCCESS;
+}
+```
+
+**FillBuffer** ([CpuContext.cpp:79-94](https://github.com/ArthurVasseur/Vkd/tree/711c288ad8596880a08ef961480cffb59cfa78a0/Src/VkdSoftware/CpuContext/CpuContext.cpp#L79-L94)) implements `vkCmdFillBuffer`:
+
+```cpp
+VkResult CpuContext::FillBuffer(vkd::Buffer::OpFill op)
+{
+    cct::UByte* data = nullptr;
+    op.dst->GetMemory()->Map(op.offset, op.size,
+                            reinterpret_cast<void**>(&data));
+
+    UInt32* data32 = reinterpret_cast<UInt32*>(data);
+    size_t count = op.size / sizeof(UInt32);
+    for (size_t i = 0; i < count; ++i)
+        data32[i] = op.data;
+
+    op.dst->GetMemory()->Unmap();
+    return VK_SUCCESS;
+}
+```
+
+### Why this design?
+
+This architecture provides several benefits:
+
+1. **Separation of concerns**: `CommandBuffer` (in `vkd`) records operations agnostically, while `CommandDispatcher` and `CpuContext` (in `vkd-Software`) handle execution details.
+
+2. **Extensibility**: A hardware backend (e.g., `vkd-AMD`) would implement its own dispatcher and context that translate operations into GPU commands.
+
+3. **Type safety**: Using `std::variant` and `std::visit` ensures compile-time checking of all operation types.
+
+---
+
+## 11 Memory management and synchronization
+
+### Device memory implementation
+
+I designed Vkd's memory management to follow the Vulkan specification for [`vkAllocateMemory`](https://registry.khronos.org/vulkan/specs/1.3-extensions/html/vkspec.html#vkAllocateMemory) and [`vkFreeMemory`](https://registry.khronos.org/vulkan/specs/1.3-extensions/html/vkspec.html#vkFreeMemory). The base `DeviceMemory` class ([Vkd/DeviceMemory/DeviceMemory.hpp](https://github.com/ArthurVasseur/Vkd/tree/711c288ad8596880a08ef961480cffb59cfa78a0/Src/Vkd/DeviceMemory/DeviceMemory.hpp)) defines an abstract interface:
+
+```cpp
+class DeviceMemory : public vkd::ObjectBase<DeviceMemory>
+{
+public:
+    virtual ~DeviceMemory() = default;
+
+    virtual VkResult Map(VkDeviceSize offset, VkDeviceSize size, void** ppData) = 0;
+    virtual void Unmap() = 0;
+
+    VkDeviceSize GetSize() const noexcept { return m_size; }
+    uint32_t GetMemoryTypeIndex() const noexcept { return m_memoryTypeIndex; }
+
+protected:
+    VkDeviceSize m_size = 0;
+    uint32_t m_memoryTypeIndex = 0;
+    bool m_mapped = false;
+};
+```
+
+The software implementation ([VkdSoftware/DeviceMemory/DeviceMemory.hpp](https://github.com/ArthurVasseur/Vkd/tree/711c288ad8596880a08ef961480cffb59cfa78a0/Src/VkdSoftware/DeviceMemory/DeviceMemory.hpp)) uses host memory:
+
+```cpp
+class DeviceMemory : public vkd::DeviceMemory
+{
+public:
+    VkResult Create(vkd::Device& owner, const VkMemoryAllocateInfo& info) override
+    {
+        m_size = info.allocationSize;
+        m_memoryTypeIndex = info.memoryTypeIndex;
+        m_data.resize(m_size);  // Allocate host memory
+        return VK_SUCCESS;
+    }
+
+    VkResult Map(VkDeviceSize offset, VkDeviceSize size, void** ppData) override
+    {
+        VKD_CHECK(!m_mapped);
+        *ppData = m_data.data() + offset;  // Return pointer into vector
+        m_mapped = true;
+        return VK_SUCCESS;
+    }
+
+    void Unmap() override
+    {
+        VKD_CHECK(m_mapped);
+        m_mapped = false;
+        // No-op: host memory remains accessible
+    }
+
+private:
+    std::vector<UByte> m_data;  // Host-side backing storage
+};
+```
+
+**Key design decisions I made:**
+
+1. **Host memory backing**: I use `std::vector<UByte>` for memory storage in the software driver, making it trivially mappable.
+
+2. **Persistent mapping**: Unlike real GPU drivers that may need to establish kernel mappings, my software implementation's memory is always accessible-I made `Unmap()` essentially a no-op that just updates the `m_mapped` flag for validation. While this simplifies the implementation, I'm still considering whether tracking the mapped state is worth it for a CPU driver.
+
+3. **No memory types**: I simplified the implementation by exposing only a single memory heap with `VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT`. But in the future, I could add support for different memory types.
+
+4. **Buffer memory binding**: When [`vkBindBufferMemory`](https://registry.khronos.org/vulkan/specs/1.3-extensions/html/vkspec.html#vkBindBufferMemory) is called, the buffer stores a pointer to the `DeviceMemory` object and the offset, allowing direct memory access during command execution.
+
+### Synchronization primitives
+
+**Fences** ([VkdSoftware/Synchronization/Fence](https://github.com/ArthurVasseur/Vkd/tree/711c288ad8596880a08ef961480cffb59cfa78a0/Src/VkdSoftware/Synchronization/Fence)) use standard C++ synchronization:
+
+```cpp
+class Fence : public vkd::Fence
+{
+public:
+    VkResult Create(vkd::Device& owner, const VkFenceCreateInfo& info) override
+    {
+        m_signaled = (info.flags & VK_FENCE_CREATE_SIGNALED_BIT) != 0;
+        return VK_SUCCESS;
+    }
+
+    void Signal()  // Called by Queue::Submit
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_signaled = true;
+        m_cv.notify_all();
+    }
+
+    VkResult Wait(uint64_t timeout) override
+    {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        if (timeout == UINT64_MAX)
+        {
+            m_cv.wait(lock, [this] { return m_signaled; });
+            return VK_SUCCESS;
+        }
+        else
+        {
+            auto success = m_cv.wait_for(lock, std::chrono::nanoseconds(timeout),
+                                        [this] { return m_signaled; });
+            return success ? VK_SUCCESS : VK_TIMEOUT;
+        }
+    }
+
+private:
+    std::mutex m_mutex;
+    std::condition_variable m_cv;
+    bool m_signaled = false;
+};
+```
+
+My fence implementation demonstrates how I can emulate GPU synchronization semantics using CPU-based primitives:
+- I use `std::mutex` + `std::condition_variable` to replace GPU wait operations
+- The timeout support matches Vulkan's `vkWaitForFences` behavior
+- Thread-safe signaling allows the queue submission thread to notify waiting threads
+
+**What I plan to add for synchronization:**
+- Semaphores (timeline and binary) for queue-to-queue synchronization
+- Events for fine-grained command buffer synchronization
+- Pipeline barriers (currently unimplemented)
+
+---
+
+## 12 Profiling infrastructure
+
+I've integrated [Tracy Profiler](https://github.com/wolfpld/tracy) into Vkd for performance analysis. The `VKD_AUTO_PROFILER_SCOPE()` macro is placed at the entry of critical functions to automatically track execution time:
+
+```cpp
+VkResult Queue::Submit(uint32_t submitCount, const VkSubmitInfo* pSubmits, VkFence fence)
+{
+    VKD_AUTO_PROFILER_SCOPE();  // Automatic scope profiling
+    // ... implementation
+}
+```
+
+**Where I've instrumented profiling:**
+- All queue operations (`Submit`, `WaitIdle`, `BindSparse`)
+- Command buffer operations (begin, end, reset)
+- Device creation and destruction
+- Memory allocation and mapping
+- Command execution in `CpuContext`
+
+Tracy provides me with a visual timeline showing:
+- Function call hierarchies
+- Execution durations
+- Thread activity
+- Bottleneck identification
+
+This instrumentation is particularly useful for analyzing the ThreadPool behavior, identifying lock contention in queue submissions, and measuring command execution overhead. Since Vkd is CPU-based, profiling helps me optimize the driver's own overhead separate from the simulated "GPU" work.
+
+---
+
+### Major features I haven't implemented yet
+
+The following Vulkan features would significantly expand Vkd's capabilities:
+
+**Rendering pipeline:**
+- Shader compilation and SPIR-V parsing (`vkCreateShaderModule`)
+- Render passes and framebuffers (`vkCreateRenderPass`, `vkCreateFramebuffer`)
+- Actual rasterization (triangle setup, fragment processing)
+- Vertex input attribute processing
+- Viewport and scissor transformations
+
+**Image/Texture support:**
+- Image creation and views (`vkCreateImage`, `vkCreateImageView`)
+- Image memory binding and layout transitions
+- Samplers (`vkCreateSampler`)
+- Image-to-image and buffer-to-image copies
+- Texture filtering and mipmapping
+
+**Descriptor sets:**
+- Descriptor set layouts and pools (`vkCreateDescriptorSetLayout`, `vkCreateDescriptorPool`)
+- Descriptor set allocation and updates
+- Binding descriptors in command buffers
+- Push constants
+
+**Synchronization:**
+- Semaphores (binary and timeline) for queue-to-queue synchronization
+- Events (`vkCreateEvent`, `vkCmdSetEvent`, `vkCmdWaitEvents`)
+- Pipeline barriers for image layout transitions
+- Memory barriers for cache coherency
+
+**Presentation:**
+- Swapchain extension (`VK_KHR_swapchain`)
+- Surface creation and present support
+- Integration with window systems (Win32, Xlib, Wayland)
+
+**Advanced features:**
+- Compute shaders and compute pipelines
+- Query pools (timestamps, occlusion queries)
+- Indirect drawing (`vkCmdDrawIndirect`, `vkCmdDrawIndexedIndirect` are stubbed)
+- Multi-draw indirect
+- Pipeline cache for faster shader compilation
+
+---
+
+## 13 References
+
+- [Vulkan 1.3 Specification](https://registry.khronos.org/vulkan/specs/1.3-extensions/html/vkspec.html)
+- [Vulkan Loader and ICD Interface](https://github.com/KhronosGroup/Vulkan-Loader/blob/main/docs/LoaderDriverInterface.md)
+- [Vkd – Vulkan Software Driver by Arthur Vasseur](https://github.com/ArthurVasseur/Vkd)
+
